@@ -1,3 +1,6 @@
+import re
+
+
 def greet(name: str) -> str:
-    trimmed_name = name.strip()
-    return f"Hello, {trimmed_name or 'guest'}!"
+    normalized_name = re.sub(r" {2,}", " ", name.strip())
+    return f"Hello, {normalized_name or 'guest'}!"

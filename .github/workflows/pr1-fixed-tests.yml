@@ -1,0 +1,96 @@
+name: Verify MICHI trial PR 1
+on:
+  push:
+    branches: [ci/pr1-fixed-tests]
+
+permissions: {}
+concurrency: michi-pr1-fixed-tests
+env:
+  REPO: setisunyuma/michi-b-acceptance
+  AUDITED_HEAD: ac844cd2064014069a866bfb9713c4fe211b7d52
+  AUDITED_BASE: c3b10e3aea9fd27e30e6bb7f31c22c0cfb26df74
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Load the audited source and project test
+        shell: bash
+        run: |
+          set -eu
+          test "$GITHUB_REPOSITORY" = "$REPO"
+          git init -q
+          git fetch -q --depth=1 "https://github.com/$REPO.git" "$AUDITED_HEAD"
+          test "$(git rev-parse FETCH_HEAD)" = "$AUDITED_HEAD"
+          git show "$AUDITED_HEAD:greeting.py" > greeting.py
+          git show "$AUDITED_HEAD:tests/test_greeting.py" > test_greeting.py
+      - name: Run two fixed acceptance tests and one project test
+        shell: bash
+        run: |
+          cat > test_fixed.py <<'PY'
+          import unittest
+
+          from greeting import greet
+
+
+          class GreetingAcceptance(unittest.TestCase):
+              def test_plain_name(self):
+                  self.assertEqual(greet("Ada"), "Hello, Ada!")
+
+              def test_surrounding_spaces(self):
+                  self.assertEqual(greet("  Ada  "), "Hello, Ada!")
+          PY
+          python3 - <<'PY'
+          import sys
+          import unittest
+
+          for module, expected in (("test_fixed", 2), ("test_greeting", 1)):
+              tests = unittest.defaultTestLoader.loadTestsFromName(module)
+              if tests.countTestCases() != expected:
+                  sys.exit(f"Unexpected test count in {module}")
+              result = unittest.TextTestRunner(verbosity=2).run(tests)
+              if (result.testsRun != expected or not result.wasSuccessful()
+                      or result.skipped or result.expectedFailures):
+                  sys.exit(1)
+          PY
+
+  report:
+    needs: test
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    steps:
+      - name: Record the result on the audited commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$REPO"
+          remote="https://github.com/$REPO.git"
+          test "$(git ls-remote "$remote" refs/heads/main | cut -f1)" = "$AUDITED_BASE"
+          test "$(git ls-remote "$remote" refs/heads/trial/greeting-001 | cut -f1)" = "$AUDITED_HEAD"
+          case "$TEST_RESULT" in
+            success) conclusion=success ;;
+            failure) conclusion=failure ;;
+            *) exit 1 ;;
+          esac
+          endpoint="repos/$REPO"
+          id="michi-pr1-fixed-tests-$AUDITED_HEAD"
+          details="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh api "$endpoint/commits/$AUDITED_HEAD/check-runs?check_name=fixed-tests&filter=all&per_page=100")
+          fields=(-f name=fixed-tests -f status=completed -f "conclusion=$conclusion"
+                  -f "external_id=$id" -f "details_url=$details")
+          if jq -e '.total_count == 0' <<< "$existing" >/dev/null; then
+            gh api -X POST "$endpoint/check-runs" -f "head_sha=$AUDITED_HEAD" "${fields[@]}" --jq '{id,name,head_sha,conclusion}'
+          else
+            check=$(jq -er --arg id "$id" --arg sha "$AUDITED_HEAD" '
+              select(.total_count == 1 and (.check_runs|length) == 1) | .check_runs[0] |
+              select(.app.slug == "github-actions" and .external_id == $id and .head_sha == $sha) | .id
+            ' <<< "$existing")
+            gh api -X PATCH "$endpoint/check-runs/$check" "${fields[@]}" --jq '{id,name,head_sha,conclusion}'
+          fi
